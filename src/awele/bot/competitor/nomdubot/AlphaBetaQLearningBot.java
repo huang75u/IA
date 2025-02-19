@@ -10,48 +10,86 @@ import java.lang.reflect.Field;
 import java.util.*;
 
 /**
- * Un Bot amélioré :
- * 1) Q-Learning avec récompenses partielles (ex. capture seed => bonus).
- * 2) Move ordering plus fin : prise en compte multi-facteurs (capture, seeds, Q, envoi seeds à l'adversaire).
- * 3) Transposition table plus complète : stocker alpha/beta + node type (LOWER,UPPER,EXACT).
+ * Bot (Q-Learning offline + Alpha-Beta depth=3 + TT + Move Ordering + PV/Killer + Evalu avancée)
+ * - Apprentissage Q-Learning sur 303 obs, avec captureReward offline.
+ * - getDecision : iterative deepening (1..MAX_DEPTH=3), PV & killer moves en move ordering.
+ * - evaluate(...) : vantage + LAMBDA*q + potGrabs - oppPotGrabs - oppNextCapture, endgame multiplier.
  */
 public class AlphaBetaQLearningBot extends CompetitorBot {
-    //===================== Paramètres =================================
+    //==================== Paramètres Principaux ====================
 
-    private static final int MAX_DEPTH = 5;       // Profondeur max
-    private static final int NB_EPOCH = 200;      // Itérations Q-learning
-    private static final double ALPHA_INIT = 0.1; // Taux apprentissage initial
+    /** Profondeur = 3，与 MinMaxBot(3)相同 */
+    private static final int MAX_DEPTH = 3;
+
+    /** Q-learning offline */
+    private static final int NB_EPOCH = 200;    //迭代次数
+    private static final double ALPHA_INIT = 0.1;
     private static final double ALPHA_DECAY = 0.995;
-    private static final double GAMMA = 0.9;      // Facteur discount
-    private static final double WIN_REWARD = 1.0;
-    private static final double LOSE_REWARD = -1.0;
-    private static final double CAPTURE_REWARD_FACTOR = 0.2; // Bonus par graine capturée offline
+    private static final double GAMMA = 0.9;
 
-    // Évaluation
-    private static final double CAPTURE_BONUS = 3.0;  // Move ordering bonus par graine
-    private static final double LAMBDA = 2.0;         // Poids du Q
-    private static final double SEEDS_WEIGHT = 0.5;   // Influence du total de graines
-    private static final double SEND_RISK_PENALTY = 1.0; // Pénalité si on “envoie” trop
-    private static final int BASE_ENCODE = 30;        // Encodage
+    private static final double REWARD_WIN = 1.0;
+    private static final double REWARD_LOSE = -1.0;
+    /** 离线对可抓子额外奖励系数 */
+    private static final double CAPTURE_REWARD_FACTOR_OFFLINE = 0.2;
 
-    //===================== Structures =================================
-    private Map<Long, double[]> qTable;  // Q(s)->[6 moves]
-    private Map<TTKey, TTEntry> transposition; // TT
+    //==================== Évaluation / MoveOrdering ====================
 
+    /** Bonus immédiat de capture (move ordering) */
+    private static final double CAPTURE_BONUS = 3.5;
+
+    /** Poids du Q值 */
+    private static final double LAMBDA = 2.2;
+
+    /** Endgame si nbSeeds <=12 => vantage *= 1.8 */
+    private static final int ENDGAME_THRESHOLD = 12;
+    private static final double ENDGAME_MULT = 1.8;
+
+    /** Pénalise adversaire下一步可抓子 */
+    private static final double OPP_CAPTURE_PENALTY = 1.7;
+
+    /** 对自己洞(1或2粒)的潜在连抓加分 */
+    private static final double MY_POTENTIAL_GRAB_BONUS = 0.4;
+
+    /** 对对手洞(1或2粒)的潜在连抓的负面 */
+    private static final double OPP_POTENTIAL_GRAB_PENALTY = 0.4;
+
+    /** Encodage base (Board 12 trous) */
+    private static final int BASE_ENCODE = 30;
+
+    //==================== Données internes ====================
+
+    private Map<Long, double[]> qTable;        // Q表： state-> Q[]
+    private Map<TTKey, TTEntry> transposition; // table de transposition
+
+    private double alpha;
     private int rootPlayer;
-    private double alpha; // Taux d'apprentissage adaptatif
 
-    //===================== Constructeur =================================
+    // Principal Variation & Killer Moves pour alphaBeta
+    private int[] principalMove;
+    private int[][] killerMoves;
+
+    //==================== Constructeur ====================
+
     public AlphaBetaQLearningBot() throws InvalidBotException {
-        this.setBotName("AlphaBetaQL_Advanced");
-        this.addAuthor("YourName");
+        this.setBotName("AlphaBetaQL_Enhanced");
+        this.addAuthor("Auteur1");
+        this.addAuthor("Auteur2");
 
         this.qTable = new HashMap<>();
         this.transposition = new HashMap<>();
         this.alpha = ALPHA_INIT;
+
+        this.principalMove = new int[MAX_DEPTH+1];
+        Arrays.fill(this.principalMove, -1);
+
+        this.killerMoves = new int[MAX_DEPTH+1][2];
+        for(int d=0; d<=MAX_DEPTH; d++){
+            Arrays.fill(this.killerMoves[d], -1);
+        }
     }
 
-    //===================== Q-Learning Offline ============================
+    //==================== Q-Learning Offline ====================
+
     @Override
     public void learn() {
         AweleData data = AweleData.getInstance();
@@ -59,292 +97,391 @@ public class AlphaBetaQLearningBot extends CompetitorBot {
 
         for(int epoch=0; epoch<NB_EPOCH; epoch++){
             for(AweleObservation obs: obsArr){
-                // Encodage de l'état
                 long sKey = encodeObservation(obs);
-                int a = obs.getMove()-1;
+                int action = obs.getMove() - 1;
 
-                // On suppose qu'on “estime” la capture offline comme 0 faute d'info
-                // Si tu as la capture, tu peux faire:
-                // double captureReward = CAPTURE_REWARD_FACTOR * [some captured seeds]
-                double captureReward = 0;
-                double r = (obs.isWon()? WIN_REWARD : LOSE_REWARD) + captureReward;
+                // base reward : gagné(+1)/perdu(-1)
+                double r = obs.isWon()? REWARD_WIN : REWARD_LOSE;
 
-                // Q(s,a) update
-                double[] qv = qTable.getOrDefault(sKey,new double[6]);
-                double oldVal = qv[a];
+                // On essaie de reconstruire le Board, pour calculer combien de graines peut-capturer offline.
+                double captureSeeds = 0;
+                try {
+                    Board b = reconstructBoard(obs);
+                    int sc = b.playMoveSimulationScore(b.getCurrentPlayer(), moveVector(action));
+                    if(sc>0) {
+                        captureSeeds = sc;
+                    }
+                } catch(Exception e) {
+                    // e.printStackTrace(); //ou ignorer
+                }
+                r += CAPTURE_REWARD_FACTOR_OFFLINE * captureSeeds;
 
-                // On n'a pas S' exact => gamma=0 OU on tente un S' reconstitué
-                // ex. Board nextBoard = simulateBoard(obs); ...
-                // double maxNextQ = ...
-                // On illustre seulement gamma=0 ou gamma*gmax=0
-                double maxNextQ=0; // Simplify
-                double target = r + GAMMA*maxNextQ;
-
-                qv[a] = oldVal + alpha*(target - oldVal);
-                qTable.put(sKey, qv);
+                double[] qVals = this.qTable.getOrDefault(sKey, new double[Board.NB_HOLES]);
+                double oldQ = qVals[action];
+                // nextState non déterminé => nextQ=0 simplifié
+                double target = r + GAMMA*0;
+                qVals[action] = oldQ + alpha*(target - oldQ);
+                this.qTable.put(sKey, qVals);
             }
             alpha *= ALPHA_DECAY;
         }
-        System.out.println("[AlphaBetaQL_Advanced] learn done. Q-table size="+qTable.size());
+        System.out.println("[AlphaBetaQL_Enhanced] Q-table size= " + qTable.size());
     }
 
-    //===================== Structures simuler Board (si besoin) =====================
-    // Si tu veux reconstituer un Board depuis un AweleObservation
-    // pour calculer nextState etc., tu peux via reflect comme précédemment.
-    /*
-    private Board simulateBoard(AweleObservation obs){
-        try {
-            Board board = new Board();
-            Field holesField = Board.class.getDeclaredField("holes");
-            holesField.setAccessible(true);
-            int[][] holes = new int[2][6];
-            System.arraycopy(obs.getOppenentHoles(),0,holes[0],0,6);
-            System.arraycopy(obs.getPlayerHoles(),0,holes[1],0,6);
-            holesField.set(board,holes);
+    /** Reconstituer Board via reflection */
+    private Board reconstructBoard(AweleObservation obs) throws Exception {
+        Board board = new Board();
+        // set holes by reflection
+        Field holesF = Board.class.getDeclaredField("holes");
+        holesF.setAccessible(true);
+        int[][] holes = new int[2][6];
 
-            Field currPlayerF = Board.class.getDeclaredField("currentPlayer");
-            currPlayerF.setAccessible(true);
-            currPlayerF.setInt(board,1);
-            return board;
-        } catch(Exception e){
-            throw new RuntimeException(e);
-        }
+        // Suppose on fait obs.getPlayerHoles() -> holes[0], obs.getOppenentHoles()-> holes[1], currentPlayer=0.
+        System.arraycopy(obs.getPlayerHoles(), 0, holes[0], 0, 6);
+        System.arraycopy(obs.getOppenentHoles(), 0, holes[1], 0, 6);
+
+        holesF.set(board, holes);
+
+        Field curF = Board.class.getDeclaredField("currentPlayer");
+        curF.setAccessible(true);
+        curF.setInt(board, 0);
+
+        return board;
     }
-    */
 
-    //===================== Cycle de vie du Bot ==========================
     @Override
     public void initialize() {
-        transposition.clear();
+        this.transposition.clear();
+        Arrays.fill(this.principalMove, -1);
+        for(int d=0; d<=MAX_DEPTH; d++){
+            Arrays.fill(this.killerMoves[d], -1);
+        }
     }
     @Override
     public void finish() {}
 
-    //===================== getDecision => IterativeDeepening + TT ==================
+    //==================== getDecision => iterative deepening ====================
+
     @Override
     public double[] getDecision(Board board) {
         this.rootPlayer = board.getCurrentPlayer();
-
         double[] bestMoves = null;
-        // Simple iterative deepening, on n'a pas le time limit code here
-        for(int depth=1; depth<=MAX_DEPTH; depth++){
-            double[] decisionAtDepth = new double[6];
-            // On fait un move ordering global
-            List<MoveInfo> moves = buildMoveInfos(board, rootPlayer);
-            moves.sort(Comparator.comparingDouble(m->-m.heuristic)); // desc
 
-            for(MoveInfo mi: moves){
+        for(int depth=1; depth<=MAX_DEPTH; depth++){
+            double[] decisionDepth = new double[Board.NB_HOLES];
+            MoveInfo[] moveInfos = new MoveInfo[Board.NB_HOLES];
+
+            // calcul heur, puis bonus PV/killer
+            for(int m=0; m<Board.NB_HOLES; m++){
                 try{
-                    if(mi.heuristic==Double.NEGATIVE_INFINITY){
-                        decisionAtDepth[mi.move] = Double.NEGATIVE_INFINITY;
+                    int sc = board.playMoveSimulationScore(rootPlayer, moveVector(m));
+                    if(sc<0){
+                        moveInfos[m]= new MoveInfo(m, Double.NEGATIVE_INFINITY);
                     } else {
-                        Board next = board.playMoveSimulationBoard(rootPlayer, moveVector(mi.move));
-                        double val = alphaBeta(next, 1, depth,
-                                Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY, false);
-                        decisionAtDepth[mi.move] = val;
+                        Board nb = board.playMoveSimulationBoard(rootPlayer, moveVector(m));
+                        double cBonus= sc * CAPTURE_BONUS;
+                        double qv= getMaxQValue(nb);
+                        double oppCap= simulateOpponentCapture(nb, 1-rootPlayer);
+
+                        double heur= cBonus + LAMBDA*qv - oppCap;
+                        moveInfos[m]= new MoveInfo(m, heur);
                     }
                 } catch(InvalidBotException e){
-                    decisionAtDepth[mi.move]=Double.NEGATIVE_INFINITY;
+                    moveInfos[m]= new MoveInfo(m,Double.NEGATIVE_INFINITY);
                 }
             }
-            bestMoves = decisionAtDepth;
+            // principalMove bonus
+            int pvM= this.principalMove[depth];
+            if(pvM>=0 && pvM<Board.NB_HOLES && moveInfos[pvM].heuristic!=Double.NEGATIVE_INFINITY){
+                moveInfos[pvM].heuristic += 100_000;
+            }
+            // killerMoves bonus
+            for(int km=0; km<2; km++){
+                int killM= this.killerMoves[depth][km];
+                if(killM>=0 && killM<Board.NB_HOLES && moveInfos[killM].heuristic!=Double.NEGATIVE_INFINITY){
+                    moveInfos[killM].heuristic += 50_000;
+                }
+            }
+
+            Arrays.sort(moveInfos, (a,b)->Double.compare(b.heuristic,a.heuristic));
+
+            double bestVal= Double.NEGATIVE_INFINITY;
+            int bestIdx=-1;
+
+            for(MoveInfo mi: moveInfos){
+                if(mi.heuristic==Double.NEGATIVE_INFINITY){
+                    decisionDepth[mi.move]= Double.NEGATIVE_INFINITY;
+                } else {
+                    try{
+                        Board child= board.playMoveSimulationBoard(rootPlayer, moveVector(mi.move));
+                        double val= alphaBeta(child,1,depth,Double.NEGATIVE_INFINITY,Double.POSITIVE_INFINITY,false);
+                        decisionDepth[mi.move]= val;
+                        if(val>bestVal){
+                            bestVal= val;
+                            bestIdx= mi.move;
+                        }
+                    }catch(InvalidBotException e){
+                        decisionDepth[mi.move]=Double.NEGATIVE_INFINITY;
+                    }
+                }
+            }
+            if(bestIdx>=0) this.principalMove[depth]= bestIdx;
+            bestMoves= decisionDepth;
         }
         return bestMoves;
     }
 
-    //===================== alphaBeta + TT plus complet ======================
-    private double alphaBeta(Board board, int curDepth, int maxDepth,
-                             double alpha, double beta, boolean isMax){
-        if(curDepth>=maxDepth || isTerminal(board)) {
+    //==================== alphaBeta with TT + killer ====================
+
+    private double alphaBeta(Board board, int currentDepth, int maxDepth, double alpha, double beta, boolean isMax){
+        if(currentDepth>=maxDepth || isTerminal(board)){
             return evaluate(board);
         }
-        // TTKey with alpha/beta
-        TTKey key = new TTKey(encodeBoard(board), maxDepth-curDepth, isMax, board.getCurrentPlayer());
-        TTEntry entry = transposition.get(key);
+        TTKey key= new TTKey(encodeBoard(board), maxDepth-currentDepth, isMax, board.getCurrentPlayer());
+        TTEntry entry= transposition.get(key);
         if(entry!=null){
-            // check bounds
-            if(entry.lowerBound >= beta) {
-                return entry.value; // cutoff
-            }
-            if(entry.upperBound <= alpha){
-                return entry.value; // cutoff
-            }
-            alpha = Math.max(alpha, entry.lowerBound);
-            beta = Math.min(beta, entry.upperBound);
+            if(entry.lowerBound>= beta) return entry.value;
+            if(entry.upperBound<= alpha) return entry.value;
+            alpha= Math.max(alpha, entry.lowerBound);
+            beta= Math.min(beta, entry.upperBound);
         }
 
-        double bestVal;
-        List<MoveInfo> moves = buildMoveInfos(board, board.getCurrentPlayer());
-        moves.sort(Comparator.comparingDouble(m->-m.heuristic)); // desc
+        double bestVal= isMax? Double.NEGATIVE_INFINITY: Double.POSITIVE_INFINITY;
+        MoveInfo[] moveInfos= new MoveInfo[Board.NB_HOLES];
+        for(int m=0; m<Board.NB_HOLES; m++){
+            try{
+                int sc= board.playMoveSimulationScore(board.getCurrentPlayer(), moveVector(m));
+                if(sc<0){
+                    moveInfos[m]= new MoveInfo(m, Double.NEGATIVE_INFINITY);
+                } else {
+                    Board nb= board.playMoveSimulationBoard(board.getCurrentPlayer(), moveVector(m));
+                    double cBonus= sc* CAPTURE_BONUS;
+                    double qv= getMaxQValue(nb);
+                    double oppCap= simulateOpponentCapture(nb, 1-board.getCurrentPlayer());
+                    double heur= cBonus + LAMBDA*qv - oppCap;
+                    moveInfos[m]= new MoveInfo(m, heur);
+                }
+            } catch(InvalidBotException e){
+                moveInfos[m]= new MoveInfo(m,Double.NEGATIVE_INFINITY);
+            }
+        }
+        Arrays.sort(moveInfos, (a,b)->Double.compare(b.heuristic,a.heuristic));
 
+        boolean cutoff=false;
+        int cutoffMove=-1;
         if(isMax){
-            bestVal = Double.NEGATIVE_INFINITY;
-            for(MoveInfo mi: moves){
-                if(mi.heuristic == Double.NEGATIVE_INFINITY) continue;
-                try {
-                    Board child = board.playMoveSimulationBoard(board.getCurrentPlayer(), moveVector(mi.move));
-                    double val = alphaBeta(child, curDepth+1, maxDepth, alpha, beta, false);
-                    bestVal = Math.max(bestVal, val);
-                    alpha = Math.max(alpha, bestVal);
-                    if(alpha>=beta) break;
-                } catch(InvalidBotException e){}
+            for(MoveInfo mi: moveInfos){
+                if(mi.heuristic==Double.NEGATIVE_INFINITY) continue;
+                try{
+                    Board child= board.playMoveSimulationBoard(board.getCurrentPlayer(), moveVector(mi.move));
+                    double val= alphaBeta(child, currentDepth+1, maxDepth, alpha,beta,false);
+                    if(val>bestVal){
+                        bestVal= val;
+                        cutoffMove= mi.move;
+                    }
+                    alpha= Math.max(alpha, bestVal);
+                    if(alpha>=beta){
+                        cutoff=true;
+                        break;
+                    }
+                } catch(InvalidBotException ignored){}
             }
         } else {
-            bestVal = Double.POSITIVE_INFINITY;
-            for(MoveInfo mi: moves){
-                if(mi.heuristic == Double.NEGATIVE_INFINITY) continue;
-                try {
-                    Board child = board.playMoveSimulationBoard(board.getCurrentPlayer(), moveVector(mi.move));
-                    double val = alphaBeta(child, curDepth+1, maxDepth, alpha, beta, true);
-                    bestVal = Math.min(bestVal, val);
-                    beta = Math.min(beta, bestVal);
-                    if(alpha>=beta) break;
-                } catch(InvalidBotException e){}
+            for(MoveInfo mi: moveInfos){
+                if(mi.heuristic==Double.NEGATIVE_INFINITY) continue;
+                try{
+                    Board child= board.playMoveSimulationBoard(board.getCurrentPlayer(), moveVector(mi.move));
+                    double val= alphaBeta(child, currentDepth+1, maxDepth, alpha,beta,true);
+                    if(val<bestVal){
+                        bestVal= val;
+                        cutoffMove= mi.move;
+                    }
+                    beta= Math.min(beta, bestVal);
+                    if(alpha>=beta){
+                        cutoff=true;
+                        break;
+                    }
+                } catch(InvalidBotException ignored){}
             }
         }
 
-        // store in TT
-        TTEntry newEntry = new TTEntry();
-        newEntry.value = bestVal;
-        if(bestVal <= alpha){
-            // upper bound
-            newEntry.upperBound = bestVal;
-            newEntry.lowerBound = Double.NEGATIVE_INFINITY;
-        } else if(bestVal >= beta){
-            // lower bound
-            newEntry.lowerBound = bestVal;
-            newEntry.upperBound = Double.POSITIVE_INFINITY;
-        } else {
-            // exact
-            newEntry.upperBound = bestVal;
-            newEntry.lowerBound = bestVal;
+        // killer moves
+        if(cutoff && cutoffMove>=0){
+            int[] kms= killerMoves[currentDepth];
+            if(kms[0]!= cutoffMove){
+                kms[1]= kms[0];
+                kms[0]= cutoffMove;
+            }
         }
-        transposition.put(key, newEntry);
+
+        TTEntry newEntry= new TTEntry();
+        newEntry.value= bestVal;
+        if(bestVal<= alpha){
+            newEntry.upperBound= bestVal;
+            newEntry.lowerBound= Double.NEGATIVE_INFINITY;
+        } else if(bestVal>= beta){
+            newEntry.lowerBound= bestVal;
+            newEntry.upperBound= Double.POSITIVE_INFINITY;
+        } else {
+            newEntry.lowerBound= bestVal;
+            newEntry.upperBound= bestVal;
+        }
+        transposition.put(key,newEntry);
 
         return bestVal;
     }
 
-    //===================== Move ordering plus fin =======================
+    //==================== Évaluation ====================
+
+    private boolean isTerminal(Board b){
+        return b.getScore(0)>=25 || b.getScore(1)>=25 || b.getNbSeeds()<=6;
+    }
+
     /**
-     * Considère :
-     *  - capture immediate
-     *  - Q(s) max
-     *  - seeds balance
-     *  - envoi seeds
+     * vantage + LAMBDA*q - oppCap*OPP_CAPTURE_PENALTY + myPotential - oppPotential, endgame多倍
      */
-    private List<MoveInfo> buildMoveInfos(Board board, int player){
-        List<MoveInfo> list = new ArrayList<>();
-        for(int move=0; move<Board.NB_HOLES; move++){
-            try{
-                int capture = board.playMoveSimulationScore(player, moveVector(move));
-                if(capture<0){
-                    list.add(new MoveInfo(move, Double.NEGATIVE_INFINITY));
-                } else {
-                    Board next = board.playMoveSimulationBoard(player, moveVector(move));
-                    double cBonus = capture * CAPTURE_BONUS;
-                    double qv = getMaxQVal(next);
-                    double seedsEval = evaluateSeeds(next, player); // ex. combien de seeds tot
-
-                    // On check combien on "envoie" à l'adversaire => ex. si trous adv reçoivent des seeds
-                    // On peut approx si next.getOpponentHoles() sum big => penalty
-                    int sumOpp = Arrays.stream(next.getOpponentHoles()).sum();
-                    double sendPenalty = sumOpp * SEND_RISK_PENALTY * 0.01; // ajuster ?
-
-                    double heur = cBonus + LAMBDA*qv + seedsEval*SEEDS_WEIGHT - sendPenalty;
-                    list.add(new MoveInfo(move, heur));
-                }
-            } catch(InvalidBotException e){
-                list.add(new MoveInfo(move, Double.NEGATIVE_INFINITY));
-            }
+    private double evaluate(Board b){
+        double vantage= b.getScore(rootPlayer)- b.getScore(1-rootPlayer);
+        if(b.getNbSeeds()<=ENDGAME_THRESHOLD){
+            vantage*= ENDGAME_MULT;
         }
-        return list;
+        double qv= getMaxQValue(b);
+        double oppCap= simulateOpponentCapture(b, 1-rootPlayer);
+        double penalty= oppCap* OPP_CAPTURE_PENALTY;
+
+        double myPot= evaluateMyPotential(b);
+        double oppPot= evaluateOppPotential(b);
+
+        return vantage + LAMBDA*qv - penalty + myPot - oppPot;
     }
 
-    private double evaluateSeeds(Board board, int player){
-        // ex. sum of player holes
-        int sumPlayer = Arrays.stream(board.getPlayerHoles()).sum();
-        // normaliser
-        return sumPlayer*0.1;
+    /**
+     * 统计 rootPlayer的洞(1或2粒)数量 * MY_POTENTIAL_GRAB_BONUS
+     */
+    private double evaluateMyPotential(Board b){
+        int[] myHoles = getRootPlayerHoles(b);
+        int count=0;
+        for(int h: myHoles){
+            if(h==1 || h==2) count++;
+        }
+        return count*MY_POTENTIAL_GRAB_BONUS;
     }
 
-    //===================== Evaluate final node =======================
-    private boolean isTerminal(Board board){
-        return board.getScore(0)>=25 || board.getScore(1)>=25 || board.getNbSeeds()<=6;
+    /**
+     * 统计 对手(1-rootPlayer)的洞(1或2粒)数量 * OPP_POTENTIAL_GRAB_PENALTY
+     */
+    private double evaluateOppPotential(Board b){
+        int[] oppHoles = getOpponentOfRootHoles(b);
+        int count=0;
+        for(int h: oppHoles){
+            if(h==1 || h==2) count++;
+        }
+        return count*OPP_POTENTIAL_GRAB_PENALTY;
     }
 
-    private double evaluate(Board board){
-        // vantage = score diff
-        double vantage = board.getScore(rootPlayer) - board.getScore(1-rootPlayer);
-
-        // Q
-        double qv = getMaxQVal(board);
-
-        return vantage + LAMBDA*qv;
+    /**
+     * rootPlayer的6个洞
+     */
+    private int[] getRootPlayerHoles(Board b){
+        // 若 b.getCurrentPlayer()==rootPlayer => b.getPlayerHoles() 就是 rootPlayer 的
+        // 否则 b.getOpponentHoles() 是 rootPlayer 的
+        if(b.getCurrentPlayer() == rootPlayer){
+            return b.getPlayerHoles();
+        } else {
+            return b.getOpponentHoles();
+        }
     }
 
-    private double getMaxQVal(Board board){
-        long code = encodeBoard(board);
-        double[] arr = qTable.getOrDefault(code, new double[6]);
-        return Arrays.stream(arr).max().orElse(0);
+    /**
+     * 对手(1-rootPlayer)的6个洞
+     */
+    private int[] getOpponentOfRootHoles(Board b){
+        int opp = 1-rootPlayer;
+        if(b.getCurrentPlayer() == opp){
+            return b.getPlayerHoles();
+        } else {
+            return b.getOpponentHoles();
+        }
     }
 
-    //===================== Encodage =======================
+    private double getMaxQValue(Board b){
+        long code= encodeBoard(b);
+        double[] arr= qTable.getOrDefault(code,new double[Board.NB_HOLES]);
+        double mx= Double.NEGATIVE_INFINITY;
+        for(double v: arr){
+            if(v>mx) mx=v;
+        }
+        return (mx<0)? 0: mx; // clamp <0 =>0
+    }
+
+    private double simulateOpponentCapture(Board b,int opp){
+        int maxCap=0;
+        for(int m=0;m<Board.NB_HOLES;m++){
+            try{
+                int sc= b.playMoveSimulationScore(opp, moveVector(m));
+                if(sc>maxCap) maxCap=sc;
+            } catch(InvalidBotException ignored){}
+        }
+        return maxCap;
+    }
+
+    private double[] moveVector(int move){
+        double[] arr = new double[Board.NB_HOLES];
+        arr[move]=1.0;
+        return arr;
+    }
+
+    //==================== Encodage (Q-table) ====================
+
     private long encodeObservation(AweleObservation obs){
-        // si on a la poss de partial capture => on l'a déjà dans la reward
-        return encodeHoles(obs.getPlayerHoles(), obs.getOppenentHoles());
+        int[] p= obs.getPlayerHoles();
+        int[] o= obs.getOppenentHoles();
+        return encodeHoles(p,o);
     }
 
-    private long encodeBoard(Board board){
-        return encodeHoles(board.getPlayerHoles(), board.getOpponentHoles());
+    private long encodeBoard(Board b){
+        return encodeHoles(b.getPlayerHoles(), b.getOpponentHoles());
     }
 
     private long encodeHoles(int[] ph, int[] oh){
         long code=0;
-        for(int x: ph) {
-            code = code*BASE_ENCODE + x;
-        }
-        for(int x: oh) {
-            code = code*BASE_ENCODE + x;
-        }
+        for(int x: ph) code= code*BASE_ENCODE + x;
+        for(int x: oh) code= code*BASE_ENCODE + x;
         return code;
     }
 
-    private double[] moveVector(int move){
-        double[] mv = new double[Board.NB_HOLES];
-        mv[move]=1.0;
-        return mv;
-    }
+    //==================== TTKey / TTEntry ====================
 
-    //===================== Structures internes =======================
-    private static class MoveInfo {
-        int move;
-        double heuristic;
-        MoveInfo(int m, double h){ move=m; heuristic=h;}
-    }
-
-    private static class TTKey {
+    private static class TTKey{
         long stateCode;
         int depth;
         boolean isMax;
         int currentPlayer;
-
-        TTKey(long c, int d, boolean im, int cp){
-            stateCode=c; depth=d; isMax=im; currentPlayer=cp;
+        TTKey(long s,int d, boolean m, int cp){
+            stateCode=s; depth=d; isMax=m; currentPlayer=cp;
         }
         @Override
         public boolean equals(Object o){
             if(!(o instanceof TTKey)) return false;
             TTKey k=(TTKey)o;
-            return (this.stateCode==k.stateCode && this.depth==k.depth && this.isMax==k.isMax && this.currentPlayer==k.currentPlayer);
+            return (stateCode==k.stateCode && depth==k.depth && isMax==k.isMax && currentPlayer==k.currentPlayer);
         }
         @Override
         public int hashCode(){
             return Objects.hash(stateCode, depth, isMax, currentPlayer);
         }
     }
-    private static class TTEntry {
+    private static class TTEntry{
         double value;
         double lowerBound=Double.NEGATIVE_INFINITY;
         double upperBound=Double.POSITIVE_INFINITY;
+    }
+
+    //==================== MoveInfo / killer ====================
+
+    private static class MoveInfo{
+        int move;
+        double heuristic;
+        MoveInfo(int m,double h){ move=m; heuristic=h;}
     }
 }
